@@ -14,12 +14,19 @@ jobs:
         uses: actions/checkout@v4
 
       # Stage 2: move the SOURCE TREE to the exact upstream commit the
-      # patches target. The bundle files are untracked in that tree and
-      # upstream has no files with these names, so they survive the switch.
+      # patches target. The bundle files are tracked on main (not in the
+      # pinned tree), so park them in /tmp and restore them after the switch.
       - name: Pin source tree to upstream commit b7f9f78f
         run: |
+          mkdir -p /tmp/bundle
+          mv zangetsu-netshare-support-full.patch \
+             zangetsu-build-enable.patch \
+             discord_partner_sdk-stub.aar \
+             pubspec.lock.ci \
+             gradle-wrapper.zip /tmp/bundle/
           git fetch --depth=1 origin b7f9f78f352a839c91d32e8335b0e1b491ec484f
-          git checkout --detach FETCH_HEAD
+          git checkout -f --detach FETCH_HEAD
+          mv /tmp/bundle/* .
           for f in zangetsu-netshare-support-full.patch zangetsu-build-enable.patch \
                    discord_partner_sdk-stub.aar pubspec.lock.ci gradle-wrapper.zip; do
             test -f "$f" || { echo "MISSING BUNDLE FILE: $f"; exit 1; }
