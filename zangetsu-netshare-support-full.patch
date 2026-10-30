@@ -1187,6 +1187,17 @@ index 0000000..c1df088
 +      ..findProxy = SystemProxy.instance.findProxyFor;
 +  }
 +}
+diff --git a/lib/features/detail/detail_screen.dart b/lib/features/detail/detail_screen.dart
+--- a/lib/features/detail/detail_screen.dart
++++ b/lib/features/detail/detail_screen.dart
+@@ -14,6 +14,7 @@
+ import 'package:share_plus/share_plus.dart';
+ import 'package:url_launcher/url_launcher.dart';
+ 
++import '../../core/network/system_proxy.dart';
+ import '../../core/zmode/season_chain.dart';
+ import '../../core/zmode/metadata_provider_prefs.dart';
+ import '../../core/ui/poster_card.dart';
 diff --git a/lib/features/detail/detail_hero.dart b/lib/features/detail/detail_hero.dart
 index 2a65e6c..6c47e28 100644
 --- a/lib/features/detail/detail_hero.dart
