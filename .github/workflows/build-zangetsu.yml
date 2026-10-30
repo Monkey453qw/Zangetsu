@@ -11,7 +11,10 @@ jobs:
       - name: Checkout (pinned to the commit the patch targets)
         uses: actions/checkout@v4
         with:
-          ref: b7f9f78
+          # Full 40-char SHA: actions/checkout treats a short SHA as a
+          # branch/tag ref pattern and the fetch fails. Commit is
+          # b7f9f78f "fix: allow verified profile PINs to unlock offline".
+          ref: b7f9f78f352a839c91d32e8335b0e1b491ec484f
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
