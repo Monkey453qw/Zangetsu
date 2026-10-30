@@ -1,0 +1,1924 @@
+diff --git a/android/app/src/main/kotlin/com/spyou/watch_app/ExternalStreamProxy.kt b/android/app/src/main/kotlin/com/spyou/watch_app/ExternalStreamProxy.kt
+index a257d55..10fc2a0 100644
+--- a/android/app/src/main/kotlin/com/spyou/watch_app/ExternalStreamProxy.kt
++++ b/android/app/src/main/kotlin/com/spyou/watch_app/ExternalStreamProxy.kt
+@@ -52,6 +52,11 @@ object ExternalStreamProxy {
+                     maxRequestsPerHost = 16
+                 },
+             )
++            // Follow the user's DoH choice (Settings → DNS) so the external-
++            // player lane keeps resolving when the OS resolver is broken or
++            // ISP-blocked — same switch the CloudStream client uses. OFF (the
++            // default) routes to system DNS, i.e. today's behavior.
++            .dns(com.spyou.watch_app.cloudstream.SelectableDns)
+             .build()
+     }
+ 
+diff --git a/android/app/src/main/kotlin/com/spyou/watch_app/MainActivity.kt b/android/app/src/main/kotlin/com/spyou/watch_app/MainActivity.kt
+index 46fde29..e1b4a62 100644
+--- a/android/app/src/main/kotlin/com/spyou/watch_app/MainActivity.kt
++++ b/android/app/src/main/kotlin/com/spyou/watch_app/MainActivity.kt
+@@ -2,10 +2,12 @@ package com.spyou.watch_app
+ 
+ import android.app.PictureInPictureParams
+ import android.content.ComponentName
++import android.content.Context
+ import android.content.Intent
+ import android.content.pm.PackageManager
+ import android.graphics.Bitmap
+ import android.media.MediaMetadataRetriever
++import android.net.ConnectivityManager
+ import android.net.Uri
+ import android.os.Build
+ import android.os.Bundle
+@@ -500,6 +502,37 @@ class MainActivity : AppCompatActivity(), FlutterEngineConfigurator {
+                 }
+             }
+ 
++        // System HTTP proxy (the per-network WiFi "Proxy" setting — NetShare
++        // no-root tethering, for one, ONLY delivers traffic through it).
++        // Dart's HttpClient cannot read that setting natively, so dio, the
++        // image cache and websockets route through whatever this returns.
++        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/network")
++            .setMethodCallHandler { call, result ->
++                if (call.method == "getHttpProxy") {
++                    val proxy: android.net.ProxyInfo? =
++                        if (Build.VERSION.SDK_INT >= 23) {
++                            (getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)?.defaultProxy
++                        } else {
++                            null
++                        }
++                    // Pre-23 fallback: the framework also exposes the active
++                    // proxy as plain system properties.
++                    val host = proxy?.host?.takeIf { it.isNotBlank() }
++                        ?: System.getProperty("http.proxyHost")?.takeIf { it.isNotBlank() }
++                    val port = proxy?.port?.takeIf { it > 0 }
++                        ?: System.getProperty("http.proxyPort")?.toIntOrNull()
++                    result.success(
++                        if (host != null && port != null && port > 0) {
++                            mapOf("host" to host, "port" to port)
++                        } else {
++                            null
++                        }
++                    )
++                } else {
++                    result.notImplemented()
++                }
++            }
++
+         // Unknown document providers return null rather than measuring a different drive.
+         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "zangetsu/storage")
+             .setMethodCallHandler { call, result ->
+diff --git a/android/app/src/main/kotlin/com/spyou/watch_app/NovelHttp.kt b/android/app/src/main/kotlin/com/spyou/watch_app/NovelHttp.kt
+index a8d4a97..326e58a 100644
+--- a/android/app/src/main/kotlin/com/spyou/watch_app/NovelHttp.kt
++++ b/android/app/src/main/kotlin/com/spyou/watch_app/NovelHttp.kt
+@@ -147,6 +147,12 @@ object NovelHttp {
+             .connectTimeout(30, TimeUnit.SECONDS)
+             .readTimeout(30, TimeUnit.SECONDS)
+             .callTimeout(30, TimeUnit.SECONDS)
++            // Follow the user's DoH choice (Settings → DNS), like every other
++            // native lane. Deliberately the ONLY network-stack change here:
++            // .dns() swaps the resolver, not the TLS stack, so the
++            // Conscrypt JA3 fingerprint this client exists to keep stays
++            // byte-identical.
++            .dns(com.spyou.watch_app.cloudstream.SelectableDns)
+             .build()
+     }
+ 
+diff --git a/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/Doh.kt b/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/Doh.kt
+index 4f7e1a9..fd5e535 100644
+--- a/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/Doh.kt
++++ b/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/Doh.kt
+@@ -1,6 +1,7 @@
+ package com.spyou.watch_app.cloudstream
+ 
+ import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.Dns
+ import okhttp3.OkHttpClient
+ import okhttp3.dnsoverhttps.DnsOverHttps
+ import java.net.InetAddress
+@@ -69,3 +70,35 @@ object Doh {
+         }.getOrDefault(builder) // any failure → leave DNS as-is (never break requests)
+     }
+ }
++
++/**
++ * A [Dns] that FOLLOWS the user's dns_choice at runtime, for the OkHttp
++ * clients built once outside [PluginHost.applyBaseClient]
++ * (ExternalStreamProxy, NovelHttp). Rebuilding those clients on every settings
++ * change would drop live sessions; instead each lookup re-reads
++ * [PluginHost.currentDnsChoice] (a volatile int compare — free) and delegates
++ * to the matching resolver, built once per choice. OFF → system DNS, which is
++ * exactly what those clients did before this existed.
++ *
++ * The DoH resolver here is built on its own throwaway client rather than the
++ * caller's: a [DnsOverHttps] must not route through the very client it
++ * resolves for (bootstrap recursion), and Tachiyomi's original pattern
++ * captures the client-so-far the same way.
++ */
++object SelectableDns : Dns {
++    @Volatile private var builtFor: Int = Int.MIN_VALUE
++    @Volatile private var delegate: Dns = Dns.SYSTEM
++
++    override fun lookup(hostname: String): List<InetAddress> {
++        val choice = PluginHost.currentDnsChoice()
++        if (choice != builtFor) {
++            // OFF (or a failed build) → OkHttpClient's default resolver is
++            // Dns.SYSTEM, which is exactly what these clients did before.
++            delegate = runCatching {
++                Doh.apply(OkHttpClient.Builder(), choice).build().dns
++            }.getOrDefault(Dns.SYSTEM)
++            builtFor = choice
++        }
++        return delegate.lookup(hostname)
++    }
++}
+diff --git a/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/PluginHost.kt b/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/PluginHost.kt
+index 15a7c68..521f20e 100644
+--- a/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/PluginHost.kt
++++ b/android/app/src/main/kotlin/com/spyou/watch_app/cloudstream/PluginHost.kt
+@@ -1152,6 +1152,14 @@ class PluginHost(private val context: Context) {
+         var INSTANCE: PluginHost? = null
+             private set
+ 
++        /** The active DoH choice for OkHttp clients built OUTSIDE
++         * [applyBaseClient] (ExternalStreamProxy, NovelHttp), so one setting
++         * covers every native lane. [Doh.OFF] until the host exists — those
++         * callers keep stock system DNS then, which is the pre-existing
++         * behavior, never a regression. */
++        @JvmStatic
++        fun currentDnsChoice(): Int = INSTANCE?.dnsChoice() ?: Doh.OFF
++
+         /** Fired by [cfChallengeInterceptor] when the shared CS client hits a
+          *  Cloudflare challenge. host/url are the challenged request's;
+          *  sourceId is the apiName [search] tagged the calling thread with, or
+diff --git a/lib/core/net/doh_client.dart b/lib/core/net/doh_client.dart
+new file mode 100644
+index 0000000..8893626
+--- /dev/null
++++ b/lib/core/net/doh_client.dart
+@@ -0,0 +1,388 @@
++import 'dart:async';
++import 'dart:convert';
++import 'dart:io';
++import 'dart:math';
++import 'dart:typed_data';
++
++import 'package:flutter/services.dart';
++
++/// DNS-over-HTTPS (RFC 8484) client with hard-coded bootstrap IPs.
++///
++/// The Dart network stack (every `HttpClient`/dio call in the app) resolves
++/// hostnames through the OS resolver. When Android "Private DNS" is in strict
++/// mode (e.g. `dns.adguard.com`), the OS resolves over DNS-over-TLS on
++/// TCP port 853 — and on networks that block that port every lookup fails and
++/// every connection freezes until it times out. This client is the escape
++/// hatch: it resolves over HTTPS on port 443, which reaches the internet on
++/// exactly the networks where :853 is dead.
++///
++/// Mirrors the native `Doh.kt` (CloudStream lane): the bootstrap IPs are
++/// literals, so the DoH endpoint itself is resolved without touching DNS at
++/// all. The TLS session for the query connects to the bootstrap IP but
++/// presents/verifies the provider's real hostname (SNI + certificate), which
++/// is what `bootstrapDnsHosts` does for OkHttp's [DnsOverHttps].
++///
++/// Used only as a FALLBACK (see resilient_http_overrides.dart): on a healthy
++/// network the OS resolver answers first and this class is never called.
++class DohClient {
++  DohClient._();
++
++  static final DohClient instance = DohClient._();
++
++  /// Provider ids — the same numbers the native side persists in
++  /// `zangetsu_cs/dns_choice` (see Doh.kt and lib/core/provider/cs_dns.dart),
++  /// so one setting covers both lanes.
++  static const int off = 0;
++  static const int cloudflare = 1;
++  static const int google = 2;
++  static const int adguard = 3;
++  static const int quad9 = 4;
++
++  /// How long one OS lookup is allowed to take before we declare it dead.
++  /// Android's DoT retry ladder can stall a lookup for 10+s on a network
++  /// where :853 is blocked; we bail much earlier and switch to DoH.
++  static const Duration osLookupTimeout = Duration(seconds: 3);
++
++  /// Cache TTL — segments/keys on one CDN host would otherwise re-query DoH
++  /// for every connection.
++  static const Duration cacheTtl = Duration(seconds: 60);
++
++  static const _maxCacheEntries = 128;
++
++  String? _preferredHost; // provider hostname, e.g. cloudflare-dns.com
++  List<String> _preferredIps = const [];
++
++  final Map<String, _CacheEntry> _cache = {};
++  final Random _random = Random.secure();
++
++  /// Picks the provider matching [choice] (the persisted dns_choice int).
++  /// [off] or an unknown value falls back to Cloudflare — the fallback
++  /// resolver must have SOME provider to be useful, and Cloudflare's
++  /// anycast is the most reliably reachable of the four.
++  void configure(int choice) {
++    switch (choice) {
++      case cloudflare:
++        _set('cloudflare-dns.com', const [
++          '1.1.1.1',
++          '1.0.0.1',
++          '162.159.36.1',
++          '162.159.46.1',
++        ]);
++      case google:
++        _set('dns.google', const ['8.8.8.8', '8.8.4.4']);
++      case adguard:
++        _set('dns.adguard-dns.com', const ['94.140.14.14', '94.140.15.15']);
++      case quad9:
++        _set('dns.quad9.net', const ['9.9.9.9', '149.112.112.112']);
++      default:
++        _set('cloudflare-dns.com', const ['1.1.1.1', '1.0.0.1']);
++    }
++  }
++
++  void _set(String host, List<String> ips) {
++    _preferredHost = host;
++    _preferredIps = ips;
++  }
++
++  /// Resolves [host] to addresses via DoH. IPv4 first (the networks where the
++  /// OS resolver dies are usually IPv4 hotspots); AAAA only when there is no
++  /// A record. Null when every bootstrap IP failed — the caller then falls
++  /// through to the native path so the original error surfaces instead of a
++  /// fabricated one.
++  Future<List<InternetAddress>?> lookup(String host) async {
++    final cached = _cache[host];
++    if (cached != null && cached.expiresAt.isAfter(DateTime.now())) {
++      return cached.addresses;
++    }
++    _pruneCache();
++
++    // Lazy default: most calls arrive before anyone configured a provider.
++    if (_preferredHost == null) configure(cloudflare);
++
++    final addresses = await _lookupUncached(host);
++    if (addresses == null || addresses.isEmpty) return null;
++    _cache[host] = _CacheEntry(addresses, DateTime.now().add(cacheTtl));
++    return addresses;
++  }
++
++  Future<List<InternetAddress>?> _lookupUncached(String host) async {
++    final deadline = DateTime.now().add(const Duration(seconds: 6));
++    for (final ip in _preferredIps) {
++      if (DateTime.now().isAfter(deadline)) return null;
++      final addr = InternetAddress.tryParse(ip);
++      if (addr == null) continue;
++      try {
++        var bytes = await _query(addr, host, 1); // A
++        var ips = parseDohResponse(bytes);
++        if (ips != null && ips.isEmpty) {
++          bytes = await _query(addr, host, 28); // AAAA
++          ips = parseDohResponse(bytes);
++        }
++        if (ips == null) continue; // rcode error / malformed → next bootstrap
++        final parsed = <InternetAddress>[];
++        for (final s in ips) {
++          final a = InternetAddress.tryParse(s);
++          if (a != null) parsed.add(a);
++        }
++        if (parsed.isNotEmpty) {
++          parsed.sort((a, b) => _rank(a).compareTo(_rank(b))); // IPv4 first
++          return parsed;
++        }
++      } catch (_) {
++        // bootstrap refused / TLS failed / timed out → try the next IP
++      }
++    }
++    return null;
++  }
++
++  static int _rank(InternetAddress a) =>
++      a.type == InternetAddressType.IPv4 ? 0 : 1;
++
++  void _pruneCache() {
++    if (_cache.length < _maxCacheEntries) return;
++    final now = DateTime.now();
++    _cache.removeWhere((_, e) => e.expiresAt.isBefore(now));
++    while (_cache.length >= _maxCacheEntries) {
++      _cache.remove(_cache.keys.first);
++    }
++  }
++
++  /// Sends one DoH query to the bootstrap IP at [addr] and returns the raw
++  /// DNS-message response body. The TCP connection goes to the IP; the TLS
++  /// handshake presents and verifies the provider's hostname.
++  Future<Uint8List> _query(InternetAddress addr, String host, int qtype) async {
++    final hostHeader = _preferredHost!;
++    Socket? raw;
++    SecureSocket? tls;
++    try {
++      raw = await Socket.startConnect(addr, 443)
++          .then((t) => t.socket)
++          .timeout(
++            const Duration(seconds: 3),
++            onTimeout: () {
++              throw SocketException('DoH connect timeout ($hostHeader)');
++            },
++          );
++      tls = await SecureSocket.secure(raw, host: hostHeader).timeout(
++        const Duration(seconds: 4),
++        onTimeout: () {
++          throw SocketException('DoH TLS timeout ($hostHeader)');
++        },
++      );
++      final id = _random.nextInt(1 << 16);
++      final query = buildDohQuery(host, id: id, qtype: qtype);
++      final b64 = base64Url.encode(query).replaceAll('=', '');
++      // `connection: close` makes the body end at EOF, so no chunked /
++      // content-length parsing is needed for the response.
++      tls.write(
++        'GET /dns-query?dns=$b64 HTTP/1.1\r\n'
++        'Host: $hostHeader\r\n'
++        'accept: application/dns-message\r\n'
++        'user-agent: Zangetsu-DoH/1\r\n'
++        'connection: close\r\n'
++        '\r\n',
++      );
++      await tls.flush();
++      final response = await _readAll(tls, budget: const Duration(seconds: 5));
++      final sep = _findHeaderEnd(response);
++      if (sep < 0) throw const FormatException('no HTTP header end from DoH');
++      final lineEnd = response.indexOf(0x0D);
++      final statusLine = utf8.decode(response.sublist(0, lineEnd));
++      final parts = statusLine.split(' ');
++      if (parts.length < 2 || parts[1] != '200') {
++        throw HttpException('DoH answered "$statusLine"');
++      }
++      return Uint8List.sublistView(response, sep + 4);
++    } catch (_) {
++      try {
++        tls?.destroy();
++      } catch (_) {}
++      try {
++        raw?.destroy();
++      } catch (_) {}
++      rethrow;
++    }
++  }
++
++  static int _findHeaderEnd(List<int> bytes) {
++    for (var i = 0; i + 3 < bytes.length; i++) {
++      if (bytes[i] == 0x0D &&
++          bytes[i + 1] == 0x0A &&
++          bytes[i + 2] == 0x0D &&
++          bytes[i + 3] == 0x0A) {
++        return i;
++      }
++    }
++    return -1;
++  }
++
++  /// Reads a socket until EOF (its peer half-closes) and returns everything.
++  static Future<Uint8List> _readAll(Socket socket, {required Duration budget}) {
++    final completer = Completer<Uint8List>();
++    final builder = BytesBuilder(copy: false);
++    late final StreamSubscription<Uint8List> sub;
++    void finish() {
++      if (completer.isCompleted) return;
++      try {
++        socket.destroy();
++      } catch (_) {}
++      completer.complete(builder.takeBytes());
++    }
++
++    sub = socket.listen(
++      builder.add,
++      onDone: finish,
++      onError: (Object e) {
++        if (completer.isCompleted) return;
++        try {
++          socket.destroy();
++        } catch (_) {}
++        completer.completeError(e);
++      },
++    );
++    Timer(budget, () {
++      if (!completer.isCompleted) {
++        sub.cancel();
++        try {
++          socket.destroy();
++        } catch (_) {}
++        completer.completeError(SocketException('DoH read timeout'));
++      }
++    });
++    return completer.future;
++  }
++
++  /// Reads the persisted native dns_choice once (best-effort) and configures
++  /// the provider, so the Dart fallback and the CloudStream lane follow the
++  /// same user setting.
++  static Future<void> configureFromNativePrefs() async {
++    try {
++      final choice =
++          await const MethodChannel('zangetsu/cloudstream')
++              .invokeMethod<int>('getDns') ??
++          cloudflare;
++      instance.configure(choice);
++    } catch (_) {
++      instance.configure(cloudflare);
++    }
++  }
++}
++
++class _CacheEntry {
++  _CacheEntry(this.addresses, this.expiresAt);
++  final List<InternetAddress> addresses;
++  final DateTime expiresAt;
++}
++
++// ── DNS wire format (RFC 1035) ───────────────────────────────────────────────
++// Pure functions, unit-tested against hand-built fixtures (test/core/net).
++
++/// Builds a recursive A/AAAA query for [host]. [id] is injectable so tests
++/// can assert the exact bytes.
++Uint8List buildDohQuery(String host, {required int id, int qtype = 1}) {
++  final labels = host.split('.');
++  final body = BytesBuilder();
++  for (final label in labels) {
++    if (label.isEmpty || label.length > 63) {
++      throw ArgumentError.value(host, 'host', 'invalid DNS label');
++    }
++    final bytes = ascii.encode(label);
++    body.addByte(bytes.length);
++    body.add(bytes);
++  }
++  body.addByte(0); // root label
++  body.add(Uint8List.fromList([0, qtype])); // QTYPE
++  body.add(Uint8List.fromList([0, 1])); // QCLASS = IN
++
++  final out = BytesBuilder();
++  out.add(Uint8List.fromList([(id >> 8) & 0xFF, id & 0xFF]));
++  out.add(Uint8List.fromList([0x01, 0x00])); // flags: RD=1
++  out.add(Uint8List.fromList([0, 1])); // QDCOUNT = 1
++  out.add(Uint8List.fromList([0, 0, 0, 0, 0, 0])); // AN/NS/ARCOUNT = 0
++  out.add(body.takeBytes());
++  return out.takeBytes();
++}
++
++/// Parses a DNS response message into A/AAAA address strings.
++/// Null when the message is malformed or carries an error rcode
++/// (NXDOMAIN etc.) — indistinguishable to the caller: no addresses.
++List<String>? parseDohResponse(List<int> b) {
++  if (b.length < 12) return null;
++  final rcode = b[3] & 0x0F;
++  if (rcode != 0) return null;
++  final answerCount = (b[6] << 8) | b[7];
++  if (answerCount == 0) return const [];
++
++  // Skip the question section: QNAME (labels, compression possible in
++  // theory) then QTYPE(2) + QCLASS(2).
++  var o = _skipName(b, 12);
++  if (o < 0 || o + 4 > b.length) return null;
++  o += 4;
++
++  final out = <String>[];
++  for (var i = 0; i < answerCount; i++) {
++    o = _skipName(b, o); // owner name (usually a compression pointer)
++    if (o < 0 || o + 10 > b.length) return out.isEmpty ? null : out;
++    final type = (b[o] << 8) | b[o + 1];
++    final rdlength = (b[o + 8] << 8) | b[o + 9];
++    o += 10;
++    if (o + rdlength > b.length) return out.isEmpty ? null : out;
++    if (type == 1 && rdlength == 4) {
++      out.add('${b[o]}.${b[o + 1]}.${b[o + 2]}.${b[o + 3]}');
++    } else if (type == 28 && rdlength == 16) {
++      out.add(_formatIpv6(b, o));
++    }
++    o += rdlength;
++  }
++  return out;
++}
++
++/// Advances past a (possibly compressed) name. Returns the offset just after
++/// it, or -1 on malformed input.
++///
++/// A compression pointer TERMINATES the name (RFC 1035 §4.1.4): the caller
++/// resumes at pointer+2 in the original stream. We deliberately do NOT follow
++/// the pointer — the name's content is irrelevant when skipping, and not
++/// following makes runaway-pointer loops impossible by construction.
++int _skipName(List<int> b, int start) {
++  var o = start;
++  while (true) {
++    if (o >= b.length) return -1;
++    final len = b[o];
++    if (len == 0) return o + 1;
++    if (len & 0xC0 == 0xC0) {
++      if (o + 1 >= b.length) return -1;
++      return o + 2;
++    }
++    if (len & 0xC0 != 0) return -1; // reserved label types
++    o += 1 + len;
++  }
++}
++
++/// Formats 16 bytes as IPv6 text (lowercase, longest zero-run collapsed) in
++/// the form [InternetAddress.parse] accepts.
++String _formatIpv6(List<int> b, int o) {
++  final groups = [
++    for (var i = 0; i < 8; i++) (b[o + 2 * i] << 8) | b[o + 2 * i + 1],
++  ];
++  var bestStart = -1, bestLen = 0, curStart = -1, curLen = 0;
++  for (var i = 0; i < 8; i++) {
++    if (groups[i] == 0) {
++      if (curStart < 0) curStart = i;
++      curLen++;
++      if (curLen > bestLen) {
++        bestStart = curStart;
++        bestLen = curLen;
++      }
++    } else {
++      curStart = -1;
++      curLen = 0;
++    }
++  }
++  String hex(int v) => v.toRadixString(16);
++  if (bestLen < 2) return groups.map(hex).join(':');
++  final head = [for (var i = 0; i < bestStart; i++) hex(groups[i])].join(':');
++  final tail = [for (var i = bestStart + bestLen; i < 8; i++) hex(groups[i])]
++      .join(':');
++  return '$head::$tail';
++}
+diff --git a/lib/core/net/resilient_http_overrides.dart b/lib/core/net/resilient_http_overrides.dart
+new file mode 100644
+index 0000000..cfb91e9
+--- /dev/null
++++ b/lib/core/net/resilient_http_overrides.dart
+@@ -0,0 +1,457 @@
++import 'dart:async';
++import 'dart:collection';
++import 'dart:io';
++import 'dart:math';
++import 'dart:typed_data';
++
++import 'doh_client.dart';
++
++/// HttpOverrides that make the whole Dart network stack survive a broken OS
++/// resolver — the roadmap's Fix B (explicit DoH upstream) + Fix C (hosts
++/// always reach the proxy as hostnames, resolution happens at one choke
++/// point) applied to this app's own traffic.
++///
++/// The problem it solves: Android "Private DNS" in strict mode resolves
++/// through DNS-over-TLS on TCP :853 (dns.adguard.com et al). On networks that
++/// block :853 — captive portals, some CGNAT/ISP filters — every
++/// `InternetAddress.lookup` stalls and fails, and with it every HttpClient,
++/// dio call, image load and WebSocket in the app freezes until it times out.
++/// The native lanes already have an opt-in DoH (`Doh.kt`), but it covered
++/// only the CloudStream client; this extends the same resilience to the Dart
++/// stack, which carries all streaming.
++///
++/// Behavior on a healthy network is byte-identical to stock: the OS resolver
++/// answers, and the connection is handed to the SDK's own
++/// `SecureSocket.startConnect` path (TLS, SNI, certificate verification and
++/// the client's `badCertificateCallback` all stay with the SDK). DoH is
++/// consulted only after the OS lookup has failed or stalled past a short
++/// timeout, plus a 30s circuit breaker so a dead resolver doesn't cost every
++/// request the probe time.
++///
++/// Install once at startup: `installResilientHttpOverrides()`.
++class ResilientHttpOverrides extends HttpOverrides {
++  ResilientHttpOverrides(this._wrapped, {this.osProbe, this.dohResolve});
++
++  final HttpOverrides? _wrapped;
++
++  /// Test seams — see [connectWithDnsFallback].
++  final Future<bool> Function(String host)? osProbe;
++  final Future<List<InternetAddress>?> Function(String host)? dohResolve;
++
++  @override
++  HttpClient createHttpClient(SecurityContext? context) {
++    // Compose with any override that was already installed (tests, other
++    // tooling) so behavior layers instead of replacing.
++    final client =
++        _wrapped?.createHttpClient(context) ?? super.createHttpClient(context);
++    client.connectionFactory = (Uri uri, String? proxyHost, int? proxyPort) =>
++        connectWithDnsFallback(
++          uri,
++          proxyHost,
++          proxyPort,
++          context,
++          osProbe: osProbe,
++          dohResolve: dohResolve,
++        );
++    return client;
++  }
++}
++
++/// How long the OS resolver gets before we declare it dead for a request.
++/// Healthy lookups answer in single-digit milliseconds; the point of the
++/// budget is to stop waiting before Android's DoT retry ladder gives up on
++/// its own many seconds later.
++const osLookupBudget = Duration(seconds: 3);
++
++/// After a failed OS lookup, skip probing it for this long and go DoH-first.
++Duration osSuspectPeriod = const Duration(seconds: 30);
++
++DateTime _osSuspectUntil = DateTime.fromMillisecondsSinceEpoch(0);
++
++/// Visible for tests.
++void resetResolverState() {
++  _osSuspectUntil = DateTime.fromMillisecondsSinceEpoch(0);
++}
++
++/// The connection decision, factored out pure so the policy is unit-testable
++/// without any network.
++enum ConnectPath {
++  /// Literal IP — nothing to resolve, connect straight to it.
++  nativeLiteral,
++
++  /// OS resolver alive (or DoH unavailable) — stock SDK behavior.
++  native,
++
++  /// OS dead, DoH answered — connect to the resolved IP (plain http).
++  dohPlain,
++
++  /// OS dead, DoH answered — TLS here with the real hostname, then an
++  /// opaque loopback relay socket for the SDK (https).
++  dohTlsRelay,
++}
++
++ConnectPath pickConnectPath({
++  required String host,
++  required bool isSecure,
++  required bool osAlive,
++  required bool dohAlive,
++}) {
++  if (InternetAddress.tryParse(host) != null) return ConnectPath.nativeLiteral;
++  if (osAlive || !dohAlive) return ConnectPath.native;
++  if (isSecure) return ConnectPath.dohTlsRelay;
++  return ConnectPath.dohPlain;
++}
++
++/// The connectionFactory body. See the class docs for the policy.
++///
++/// [osProbe] and [dohResolve] exist for tests only: they replace the live
++/// OS-lookup probe and the DoH resolver so the rescue paths can be exercised
++/// against local sockets. Production calls leave them null.
++Future<ConnectionTask<Socket>> connectWithDnsFallback(
++  Uri uri,
++  String? proxyHost,
++  int? proxyPort,
++  SecurityContext? context, {
++  Future<bool> Function(String host)? osProbe,
++  Future<List<InternetAddress>?> Function(String host)? dohResolve,
++}) async {
++  // Proxied requests keep stock behavior: connect to the proxy; the SDK
++  // builds the CONNECT tunnel and does TLS itself (createProxyTunnel).
++  if (proxyHost != null) return Socket.startConnect(proxyHost, proxyPort!);
++
++  final isSecure = uri.scheme == 'https';
++  final host = uri.host;
++  final port = uri.port == 0 ? (isSecure ? 443 : 80) : uri.port;
++
++  Future<ConnectionTask<Socket>> native() => isSecure
++      ? SecureSocket.startConnect(host, port, context: context)
++      : Socket.startConnect(host, port);
++
++  // Literal IPs (the local cast/external stream proxies advertise
++  // http://<lan-ip>:<port>/…) must never touch a resolver.
++  final isLiteral = InternetAddress.tryParse(host) != null;
++
++  var osAlive = true;
++  if (!isLiteral && DateTime.now().isAfter(_osSuspectUntil)) {
++    osAlive = osProbe != null
++        ? await osProbe(host)
++        : await _osLookupAlive(host);
++    if (osAlive) {
++      resetResolverState();
++    } else {
++      _osSuspectUntil = DateTime.now().add(osSuspectPeriod);
++    }
++  } else if (!isLiteral) {
++    osAlive = false;
++  }
++
++  if (isLiteral || osAlive) return native();
++
++  // OS resolver is dead → explicit DoH (the Fix-B upstream).
++  final ips = dohResolve != null
++      ? await dohResolve(host)
++      : await DohClient.instance.lookup(host);
++  if (ips == null || ips.isEmpty) return native(); // surface the real error
++
++  if (!isSecure) return Socket.startConnect(ips.first, port);
++
++  // https rescue. With a connectionFactory the SDK treats the returned
++  // socket as final — no TLS is applied later (verified against the SDK
++  // source: no startSecure on the direct path). So the TLS handshake
++  // happens HERE, against `host`, keeping SNI and certificate verification
++  // correct — connecting by IP with SNI=IP would fail hostname checks and
++  // get SNI-rejected by many CDNs. The TLS socket is then paired 1:1 with
++  // a loopback relay socket the SDK can treat as an opaque connection.
++  SecureSocket? tls;
++  try {
++    for (final ip in ips) {
++      try {
++        final raw = await Socket.startConnect(ip, port)
++            .then((t) => t.socket)
++            .timeout(
++              const Duration(seconds: 5),
++              onTimeout: () {
++                throw SocketException('connect timeout ($host)');
++              },
++            );
++        tls = await SecureSocket.secure(raw, host: host, context: context)
++            .timeout(
++              const Duration(seconds: 7),
++              onTimeout: () {
++                throw SocketException('TLS timeout ($host)');
++              },
++            );
++        break;
++      } on Exception catch (_) {
++        try {
++          tls?.destroy();
++        } catch (_) {}
++        tls = null;
++        // next resolved address
++      }
++    }
++    if (tls == null) return native(); // every address failed — real error out
++
++    final relayPort = await LoopbackRelay.instance.ensure();
++    final token = LoopbackRelay.instance.enqueue(tls);
++    // `Socket.startConnect` yields a Future<ConnectionTask> — the factory's
++    // contract is to return exactly that future, so the SDK gets the real
++    // task (with working cancel()) rather than a wrapper.
++    final task = Socket.startConnect(InternetAddress.loopbackIPv4, relayPort);
++    // Gate handshake: identify ourselves before any HTTP bytes flow, so the
++    // relay never pipes for some other app that found the port (loopback is
++    // shared between Android apps). Sent before the SDK's first write lands.
++    final connTask = await task.timeout(const Duration(seconds: 3));
++    final client = await connTask.socket.timeout(const Duration(seconds: 3));
++    client.add(token);
++    await client.flush();
++    return connTask;
++  } on Exception {
++    try {
++      tls?.destroy();
++    } catch (_) {}
++    return native(); // rescue failed → behave exactly like stock would have
++  }
++}
++
++Future<bool> _osLookupAlive(String host) async {
++  try {
++    final result = await InternetAddress.lookup(host).timeout(osLookupBudget);
++    return result.isNotEmpty;
++  } on Exception {
++    return false; // SocketException (resolver dead) or TimeoutException
++  }
++}
++
++/// Pairs sockets produced by the https rescue path with the SDK.
++///
++/// `ConnectionTask` has no public constructor, so the factory cannot wrap an
++/// already-established TLS socket in one. Instead the TLS socket is parked
++/// here and the factory returns a loopback connect task; each accepted
++/// loopback connection is then spliced byte-for-byte onto its parked TLS
++/// socket. The HTTP layer never notices: for the SDK the relay socket is an
++/// opaque, bidirectional, keep-alive-capable connection — exactly what a
++/// normal socket is.
++class LoopbackRelay {
++  LoopbackRelay._();
++
++  static final LoopbackRelay instance = LoopbackRelay._();
++
++  ServerSocket? _server;
++  final Queue<_Parked> _pending = Queue();
++  final Random _random = Random.secure();
++
++  /// Idle cap on parked sockets — nothing should sit here long (the factory
++  /// connects loopback within the same event-loop turn sequence), but a crash
++  /// between enqueue and connect must not leak TLS sockets.
++  static const _parkBudget = Duration(seconds: 10);
++
++  Future<int> ensure() async {
++    final existing = _server;
++    if (existing != null) return existing.port;
++    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
++    server.listen(_accept, onError: (_) {});
++    _server = server;
++    return server.port;
++  }
++
++  /// Parks [upstream] and returns the 16-byte token the client must present.
++  /// Takes a plain [Socket] so tests can pair a mock upstream; production
++  /// always hands in the SecureSocket from the rescue path.
++  Uint8List enqueue(Socket upstream) {
++    final token = Uint8List(16);
++    for (var i = 0; i < 16; i++) {
++      token[i] = _random.nextInt(256);
++    }
++    final parked = _Parked(upstream, token);
++    _pending.addLast(parked);
++    Timer(_parkBudget, () {
++      if (_pending.remove(parked)) {
++        try {
++          upstream.destroy();
++        } catch (_) {}
++      }
++    });
++    return token;
++  }
++
++  void _accept(Socket client) {
++    final _Parked parked;
++    try {
++      if (_pending.isEmpty) {
++        client.destroy();
++        return;
++      }
++      parked = _pending.removeFirst();
++    } catch (_) {
++      client.destroy();
++      return;
++    }
++    _gate(client, parked);
++  }
++
++  /// Reads the 16-byte token, then splices the client onto the parked
++  /// upstream. Anything past the token (TCP may coalesce it with the first
++  /// HTTP bytes) is carried into the pipe.
++  ///
++  /// The pipe's client leg REUSES the subscription opened here: dart:io
++  /// socket streams are single-subscription, so cancelling to re-listen in
++  /// [spliceNew] would throw "Stream has already been listened to" on every
++  /// rescue. The handlers are swapped on the live subscription instead.
++  void _gate(Socket client, _Parked parked) {
++    final upstream = parked.upstream;
++    final buffer = BytesBuilder(copy: false);
++    var done = false;
++    late final StreamSubscription<Uint8List> sub;
++
++    void die() {
++      try {
++        client.destroy();
++      } catch (_) {}
++      try {
++        upstream.destroy();
++      } catch (_) {}
++    }
++
++    void unpair() {
++      try {
++        client.destroy();
++      } catch (_) {}
++      _pending.addFirst(parked);
++    }
++
++    // A gate that never finishes must not hold the TLS socket forever.
++    final gateTimer = Timer(const Duration(seconds: 3), () {
++      if (done) return;
++      done = true;
++      try {
++        sub.cancel();
++      } catch (_) {}
++      unpair();
++    });
++
++    sub = client.listen(
++      (chunk) {
++        if (done) return;
++        buffer.add(chunk);
++        if (buffer.length < 16) return;
++        done = true;
++        gateTimer.cancel();
++        final bytes = buffer.takeBytes();
++        for (var i = 0; i < 16; i++) {
++          if (bytes[i] != parked.token[i]) {
++            // Wrong token — some other process found the port. Refuse, and
++            // keep the parked socket available for the real client (its own
++            // connect is already in flight; the next accept pairs with it).
++            unpair();
++            return;
++          }
++        }
++        try {
++          final leading = bytes.length > 16
++              ? Uint8List.sublistView(bytes, 16)
++              : null;
++          if (leading != null && leading.isNotEmpty) upstream.add(leading);
++          // Swap the gate's handlers into a pipe: client → upstream keeps
++          // this subscription (with backpressure), upstream → client opens
++          // a fresh one.
++          sub
++            ..onData((chunk) {
++              upstream.add(chunk);
++              sub.pause();
++              upstream
++                  .flush()
++                  .then((_) {
++                    try {
++                      sub.resume(); // destroyed peer → the add throws → onError
++                    } catch (_) {
++                      die();
++                    }
++                  })
++                  .catchError((Object _) => die());
++            })
++            ..onDone(die)
++            ..onError((Object _) => die());
++          spliceNew(upstream, client);
++        } catch (_) {
++          die();
++        }
++      },
++      onDone: () {
++        if (!done) {
++          // Client vanished before completing the handshake — give the parked
++          // socket back to the front of the queue for the next accept (the
++          // real client's connect may still be in flight; if it was this
++          // client that died, the park timer reclaims the socket instead).
++          done = true;
++          gateTimer.cancel();
++          unpair();
++        }
++      },
++      onError: (_) {
++        if (!done) {
++          done = true;
++          gateTimer.cancel();
++          unpair();
++        } else {
++          die();
++        }
++      },
++      cancelOnError: false,
++    );
++  }
++
++  /// Bidirectional pump over two FRESH subscriptions, with backpressure: the
++  /// reader is paused while the writer's buffer drains, so a 4K segment flood
++  /// can't buffer unboundedly.
++  static void spliceNew(Socket from, Socket to) {
++    void die() {
++      try {
++        from.destroy();
++      } catch (_) {}
++      try {
++        to.destroy();
++      } catch (_) {}
++    }
++
++    late final StreamSubscription<Uint8List> sub;
++    sub = from.listen(
++      (chunk) {
++        to.add(chunk);
++        sub.pause();
++        to
++            .flush()
++            .then((_) {
++              try {
++                sub.resume(); // destroyed peer → the add throws → onError
++              } catch (_) {
++                die();
++              }
++            })
++            .catchError((Object _) => die());
++      },
++      onDone: die,
++      onError: (_) => die(),
++    );
++  }
++}
++
++class _Parked {
++  _Parked(this.upstream, this.token);
++  final Socket upstream;
++  final Uint8List token;
++}
++
++/// Installs the resilient resolver as the process-wide default. Every
++/// `HttpClient()` afterwards — dio adapters, image loads, Supabase/Firebase,
++/// WebSockets, the cast proxy's own upstream client — inherits the
++/// OS-first/DoH-fallback behavior. Idempotent (keeps the existing override as
++/// the wrapped delegate on repeat calls).
++///
++/// Runs the one-shot provider sync (dns_choice → DoH provider) in the
++/// background; until it lands the resolver defaults to Cloudflare.
++void installResilientHttpOverrides() {
++  if (HttpOverrides.current is ResilientHttpOverrides) return;
++  unawaited(DohClient.configureFromNativePrefs());
++  HttpOverrides.global = ResilientHttpOverrides(HttpOverrides.current);
++}
+diff --git a/lib/core/network/system_proxy.dart b/lib/core/network/system_proxy.dart
+new file mode 100644
+index 0000000..c1df088
+--- /dev/null
++++ b/lib/core/network/system_proxy.dart
+@@ -0,0 +1,171 @@
++// System HTTP proxy support.
++//
++// On proxy-only networks — NetShare-style no-root tethering is the common
++// case — the WiFi network carries an HTTP proxy in its settings and delivers
++// NO other traffic: raw TCP/UDP to the internet is simply not routed, and
++// system DNS can be dead too (strict Private DNS / DoT :853 never traverses
++// an HTTP proxy). Android's native stacks (OkHttp, WebView,
++// HttpURLConnection) honor that proxy automatically, but Dart's HttpClient
++// cannot read it, which leaves the whole Dart side (dio, image cache,
++// websockets) and mpv dead on such networks.
++//
++// This service reads the active network's HTTP proxy from the platform and
++// installs a process-wide HttpOverrides so every dart:io client routes
++// through it. Proxied requests hand the TARGET HOSTNAME to the proxy via
++// CONNECT — the proxy resolves it — so no local DNS lookup is involved and
++// the app works even while strict Private DNS is unreachable on the network.
++//
++// mpv is handled per-open via [applyMpvProxy]: internet streams get the
++// proxy, while the app's own localhost/LAN servers (Aniyomi local-proxy
++// fallback, cast proxy) are pinned to DIRECT so they never loop out through
++// the WAN proxy.
++//
++// No settings UI on purpose: honoring a proxy the user explicitly
++// configured for this network is the standard, expected behavior.
++import 'dart:async';
++import 'dart:io';
++
++import 'package:flutter/services.dart';
++import 'package:media_kit/media_kit.dart';
++
++import '../logging/app_logger.dart';
++
++class SystemProxy {
++  SystemProxy._();
++
++  static final SystemProxy instance = SystemProxy._();
++
++  static const MethodChannel _channel = MethodChannel('zangetsu/network');
++
++  String? _host;
++  int? _port;
++
++  /// True when an HTTP proxy is currently available for internet traffic.
++  bool get hasProxy => _host != null && _port != null && _port! > 0;
++
++  /// "host:port" of the active proxy (logs only — read [hasProxy] first).
++  String get authority => '$_host:$_port';
++
++  /// Re-read the platform proxy. Cheap — call at boot and on app resume, so
++  /// roaming between networks (hotspot ↔ home WiFi) picks up the new config.
++  Future<void> refresh() async {
++    String? host;
++    int? port;
++    if (Platform.isAndroid) {
++      try {
++        final reply = await _channel
++            .invokeMethod<Map<dynamic, dynamic>>('getHttpProxy')
++            .timeout(const Duration(seconds: 3));
++        if (reply != null) {
++          host = reply['host'] as String?;
++          final rawPort = reply['port'];
++          port = rawPort is int
++              ? rawPort
++              : rawPort is num
++                  ? rawPort.toInt()
++                  : int.tryParse('$rawPort');
++        }
++      } on TimeoutException {
++        AppLogger.instance.log(
++          '[proxy] lookup timed out; staying DIRECT',
++          level: 'W',
++        );
++        return;
++      } on MissingPluginException {
++        // No native handler (tests, non-Android runner) — stay DIRECT.
++        return;
++      } catch (e) {
++        AppLogger.instance.log('[proxy] lookup failed: $e', level: 'W');
++        return;
++      }
++    } else {
++      // Desktop dev builds: standard proxy environment variables.
++      final env = Platform.environment['HTTP_PROXY'] ??
++          Platform.environment['http_proxy'] ??
++          '';
++      if (env.isNotEmpty) {
++        final uri = Uri.tryParse(
++          env.contains('://') ? env : 'http://$env',
++        );
++        host = uri?.host;
++        port = uri?.port;
++      }
++    }
++    _host = (host == null || host.isEmpty) ? null : host;
++    _port = (port != null && port > 0) ? port : null;
++    AppLogger.instance.log(
++      '[proxy] ${hasProxy ? 'system HTTP proxy active: $authority' : 'no system proxy — DIRECT'}',
++    );
++  }
++
++  /// HttpClient.findProxy callback. Localhost and LAN destinations stay
++  /// DIRECT: the app serves and reaches its own cast/stream proxies on the
++  /// local network, and those must never be pushed through the WAN proxy.
++  String findProxyFor(Uri uri) {
++    if (!hasProxy || bypassesProxy(uri.host)) return 'DIRECT';
++    return 'PROXY $authority';
++  }
++
++  /// mpv `http-proxy` value handling for opening [url]: set the active proxy
++  /// for internet streams, '' (explicitly DIRECT) for the app's own
++  /// localhost/LAN servers. mpv reads the property at stream-open time, so
++  /// setting it right before each open is race-free against the next one.
++  /// No-op on non-native players (tvOS AVPlayer, tests).
++  Future<void> applyMpvProxy(Player player, String url) async {
++    final platform = player.platform;
++    if (platform is! NativePlayer) return;
++    final proxied = hasProxy && !bypassesProxy(Uri.tryParse(url)?.host);
++    try {
++      await platform.setProperty(
++        'http-proxy',
++        proxied ? 'http://$authority' : '',
++      );
++    } catch (e) {
++      // Never let proxy bookkeeping sink playback.
++      AppLogger.instance.log('[proxy] mpv http-proxy failed: $e', level: 'W');
++    }
++  }
++}
++
++/// True for destinations that must never go through the WAN proxy: loopback,
++/// the LAN (private/link-local ranges — Chromecast, the hotspot gateway, the
++/// app's own local servers) and mDNS-style names.
++bool bypassesProxy(String? hostRaw) {
++  if (hostRaw == null || hostRaw.isEmpty) return true;
++  final host = hostRaw.toLowerCase();
++  final address = InternetAddress.tryParse(host);
++  if (address != null) return _isLocalOrLanAddress(address);
++  return host == 'localhost' ||
++      host.endsWith('.localhost') ||
++      host.endsWith('.local');
++}
++
++bool _isLocalOrLanAddress(InternetAddress address) {
++  if (address.isLoopback || address.isLinkLocal) return true;
++  if (address.type == InternetAddressType.IPv4) {
++    final parts = address.address.split('.');
++    if (parts.length != 4) return false;
++    final a = int.parse(parts[0]);
++    final b = int.parse(parts[1]);
++    // 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16 (which includes NetShare's
++    // 192.168.49.1 gateway).
++    return a == 10 ||
++        (a == 172 && b >= 16 && b <= 31) ||
++        (a == 192 && b == 168);
++  }
++  // IPv6 unique-local fc00::/7 (addresses starting fc or fd).
++  final raw = address.address;
++  return raw.startsWith('fc') || raw.startsWith('fd');
++}
++
++/// Routes every dart:io HttpClient created from now on (dio, the image
++/// cache, websockets, supabase/appwrite) through [SystemProxy.findProxyFor].
++/// Install once at boot; the callback reads live state, so a later proxy
++/// change applies to every client created afterwards without re-installing.
++class ProxyHttpOverrides extends HttpOverrides {
++  @override
++  HttpClient createHttpClient(SecurityContext? context) {
++    return super.createHttpClient(context)
++      ..findProxy = SystemProxy.instance.findProxyFor;
++  }
++}
+diff --git a/lib/features/detail/detail_hero.dart b/lib/features/detail/detail_hero.dart
+index 2a65e6c..6c47e28 100644
+--- a/lib/features/detail/detail_hero.dart
++++ b/lib/features/detail/detail_hero.dart
+@@ -309,6 +309,9 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
+         await player.setVolume(_muted ? 0 : 100);
+         // Loop the single trailer media (Netflix-style).
+         await player.setPlaylistMode(PlaylistMode.single);
++        // System HTTP proxy (NetShare-style proxy-only networks) for the
++        // internet stream; localhost/LAN would be pinned DIRECT anyway.
++        await SystemProxy.instance.applyMpvProxy(player, url);
+         await player.open(Media(url), play: false);
+       });
+       if (!mounted || player != _player || !lifecycle.canContinue(openToken)) {
+@@ -358,7 +361,10 @@ class _HeroTrailerState extends State<_HeroTrailer> with RouteAware {
+       try {
+         await lifecycle.trackOpen(
+           openToken,
+-          () => player.open(Media(low), play: false),
++          () async {
++            await SystemProxy.instance.applyMpvProxy(player, low);
++            await player.open(Media(low), play: false);
++          },
+         );
+         if (!_paused &&
+             !widget.collapsed &&
+diff --git a/lib/features/player/player_controller.dart b/lib/features/player/player_controller.dart
+index 8f36ee2..f7c5681 100644
+--- a/lib/features/player/player_controller.dart
++++ b/lib/features/player/player_controller.dart
+@@ -15,6 +15,7 @@ import 'package:path_provider/path_provider.dart';
+ import '../../core/app_mode.dart';
+ import '../../core/di/injector.dart';
+ import '../../core/discord/discord_presence.dart';
++import '../../core/network/system_proxy.dart';
+ import '../../core/discord/discord_rpc.dart';
+ import '../../core/share/share_link.dart';
+ import '../../core/logging/app_logger.dart';
+@@ -2888,6 +2889,11 @@ class PlayerCubit extends Cubit<PlayerState> {
+         }
+       });
+     }
++    // System HTTP proxy (NetShare-style proxy-only networks): point mpv at
++    // the WiFi proxy for internet streams, and pin the app's own
++    // localhost/LAN servers (the Aniyomi proxy fallback above, cast) to
++    // DIRECT so they never loop out through the WAN proxy.
++    setupSteps.add(() => SystemProxy.instance.applyMpvProxy(player, playUrl));
+     setupSteps.add(() async {
+       if (!softwareDecodeRetry) {
+         _softwareDecodeRetried = false;
+diff --git a/lib/features/player/seek_preview.dart b/lib/features/player/seek_preview.dart
+index a89023a..b44d0e4 100644
+--- a/lib/features/player/seek_preview.dart
++++ b/lib/features/player/seek_preview.dart
+@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
+ import 'package:media_kit/media_kit.dart';
+ import 'package:media_kit_video/media_kit_video.dart';
+ 
++import '../../core/network/system_proxy.dart';
++
+ /// Generates Netflix/CloudStream-style scrub-preview frames.
+ ///
+ /// Two engines, picked per source:
+@@ -120,6 +122,11 @@ class SeekPreview {
+         );
+       } catch (_) {}
+     }
++    // System HTTP proxy (NetShare-style proxy-only networks): the preview
++    // fetches the same internet stream as the main player, so it needs the
++    // WiFi proxy too. Localhost/LAN are pinned DIRECT inside applyMpvProxy;
++    // no-op on non-native players.
++    await SystemProxy.instance.applyMpvProxy(p, uri);
+     await p.open(Media(uri, httpHeaders: headers), play: false);
+     if (!_disposed) videoController.value = vc;
+     _opening = false;
+diff --git a/lib/features/trailer/trailer_screen.dart b/lib/features/trailer/trailer_screen.dart
+index f906d52..f7f598b 100644
+--- a/lib/features/trailer/trailer_screen.dart
++++ b/lib/features/trailer/trailer_screen.dart
+@@ -3,6 +3,7 @@ import 'package:media_kit/media_kit.dart';
+ import 'package:media_kit_video/media_kit_video.dart';
+ 
+ import '../../core/di/injector.dart';
++import '../../core/network/system_proxy.dart';
+ import '../../core/playback/playback_prefs.dart';
+ import '../../core/theme/app_colors.dart';
+ import '../../core/theme/app_text.dart';
+@@ -55,6 +56,7 @@ class _TrailerScreenState extends State<TrailerScreen> {
+       return;
+     }
+     try {
++      await SystemProxy.instance.applyMpvProxy(_player, url);
+       await _player.open(Media(url)); // unmuted, autoplay (default volume 100)
+       if (!mounted) return;
+       setState(() => _resolved = true);
+@@ -74,6 +76,7 @@ class _TrailerScreenState extends State<TrailerScreen> {
+   Future<bool> _openHd(({String video, String audio}) hd) async {
+     try {
+       Future<void> setup() async {
++        await SystemProxy.instance.applyMpvProxy(_player, hd.video);
+         await _player.open(Media(hd.video)); // unmuted, autoplay
+         final p = _player.platform;
+         if (p is NativePlayer) {
+diff --git a/lib/main.dart b/lib/main.dart
+index 949a6de..84e46a4 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -1,5 +1,5 @@
+ import 'dart:async';
+-import 'dart:io' show Platform;
++import 'dart:io' show HttpOverrides, Platform;
+ import 'dart:ui' show PlatformDispatcher;
+ 
+ import 'package:firebase_core/firebase_core.dart';
+@@ -22,6 +22,8 @@ import 'core/discord/discord_rpc.dart';
+ import 'core/environment.dart';
+ import 'core/logging/app_logger.dart';
+ import 'core/logging/crash_reports.dart';
++import 'core/net/resilient_http_overrides.dart';
++import 'core/network/system_proxy.dart';
+ import 'core/platform/apple_tv.dart';
+ import 'core/platform/android_mpv.dart';
+ import 'core/platform/trusted_certificates.dart';
+@@ -89,6 +91,23 @@ Future<void> main() async {
+         CrashReports.record(error, stack, fatal: true);
+         return true;
+       };
++      // Route dart:io traffic (dio, image cache, websockets) through the
++      // system HTTP proxy when the network has one — NetShare-style
++      // proxy-only hotspots deliver nothing else. The overrides callback
++      // reads live state, so the async lookup below refines it the moment
++      // it lands (DIRECT until then; bounded like every boot step).
++      // Installed BEFORE the resilient-DoH overrides on purpose: that one
++      // wraps whatever is current and its connectionFactory forwards proxied
++      // connects straight to the proxy (no DNS), so the two layer cleanly —
++      // proxy → CONNECT tunnel; direct → OS resolver with DoH fallback.
++      HttpOverrides.global = ProxyHttpOverrides();
++      try {
++        await SystemProxy.instance
++            .refresh()
++            .timeout(const Duration(seconds: 2));
++      } catch (e) {
++        AppLogger.instance.log('[proxy] boot lookup skipped: $e', level: 'W');
++      }
+       // Install public roots before Firebase, Supabase, images, or providers
+       // create HTTPS clients. A broken asset falls back to platform validation.
+       if (Platform.isAndroid) {
+@@ -99,6 +118,18 @@ Future<void> main() async {
+           AppLogger.instance.logError(e, st);
+         }
+       }
++      // Resilient DNS for the Dart network stack: when the OS resolver is
++      // failing (Android Private DNS in strict mode over a network that
++      // blocks DNS-over-TLS :853), fall back to explicit DoH instead of
++      // letting every stream freeze until timeout. Healthy networks keep the
++      // stock resolution path untouched. Must run before the first
++      // HttpClient() — same placement rules as the trust roots above.
++      try {
++        installResilientHttpOverrides();
++        AppLogger.instance.log('[dns] Resilient DoH fallback installed');
++      } catch (e, st) {
++        AppLogger.instance.logError(e, st);
++      }
+       // Cap the in-memory image cache so a heavy source's posters + heroes can't
+       // pile up and OOM-crash (default is 100 MB; libmpv adds a big native
+       // baseline). On-screen images stay full quality; far-off-screen ones reload
+@@ -184,6 +215,11 @@ Future<void> main() async {
+       // Dependency init happens inside the boot gate so the splash shows
+       // immediately instead of a blank screen.
+       runApp(const WatchApp());
++      // The WiFi proxy changes when the device roams between networks
++      // (hotspot ↔ home WiFi) — re-read it whenever the app resumes.
++      AppLifecycleListener(
++        onResume: () => unawaited(SystemProxy.instance.refresh()),
++      );
+     },
+     (error, stack) {
+       AppLogger.instance.logError(error, stack);
+diff --git a/test/core/net/doh_client_test.dart b/test/core/net/doh_client_test.dart
+new file mode 100644
+index 0000000..04ccc54
+--- /dev/null
++++ b/test/core/net/doh_client_test.dart
+@@ -0,0 +1,121 @@
++import 'dart:typed_data';
++
++import 'package:flutter_test/flutter_test.dart';
++import 'package:watch_app/core/net/doh_client.dart';
++
++// Fixtures are real DNS wire messages, generated independently (Python,
++// struct-packed) and cross-checked with a separate decoder — not derived
++// from the implementation under test. The A-record fixture carries a CNAME
++// chain (answer 1) whose owner names use compression pointers (answer 2),
++// the classic shape of a real recursive answer.
++
++const _queryExampleCom =
++    '123401000001000000000000'
++    '076578616d706c6503636f6d0000010001';
++
++const _respAWithCnameChain =
++    '123481800001000200000000076578616d706c6503636f6d0000010001'
++    '076578616d706c6503636f6d00000500010000012c001103777777076578616d706c65'
++    '03636f6d00c034000100010000003c00045db8d822';
++
++const _respAaaa =
++    '0bb881800001000100000000046970763606676f6f676c6503636f6d00'
++    '001c0001046970763606676f6f676c6503636f6d00001c0001000000780010'
++    '26064700470000000000000000001111';
++
++const _respNxdomain =
++    '000181830001000000000000046e6f7065076578616d706c6503636f6d0000010001';
++
++const _respNoAnswers =
++    '00028180000100000000000005656d707479076578616d706c6503636f6d0000010001';
++
++Uint8List _hex(String h) => Uint8List.fromList([
++  for (var i = 0; i + 1 < h.length; i += 2)
++    int.parse(h.substring(i, i + 2), radix: 16),
++]);
++
++void main() {
++  group('buildDohQuery', () {
++    test('encodes example.com A with the exact wire bytes', () {
++      final q = buildDohQuery('example.com', id: 0x1234, qtype: 1);
++      expect(q, _hex(_queryExampleCom));
++    });
++
++    test('encodes an AAAA query (qtype 28)', () {
++      final q = buildDohQuery('a.b', id: 0, qtype: 28);
++      // header(12) + labels + root + qtype + qclass
++      expect(q.length, 12 + 2 + 2 + 1 + 2 + 2);
++      expect(q[12], 1);
++      expect(q.sublist(q.length - 4), [0, 28, 0, 1]);
++    });
++
++    test('rejects empty and oversized labels', () {
++      expect(() => buildDohQuery('.example.com', id: 1), throwsArgumentError);
++      expect(
++        () => buildDohQuery('${'x' * 64}.com', id: 1),
++        throwsArgumentError,
++      );
++    });
++  });
++
++  group('parseDohResponse', () {
++    test('extracts the A record behind a CNAME chain with pointers', () {
++      expect(parseDohResponse(_hex(_respAWithCnameChain)), ['93.184.216.34']);
++    });
++
++    test('extracts an IPv6 address from an AAAA answer', () {
++      expect(parseDohResponse(_hex(_respAaaa)), ['2606:4700:4700::1111']);
++    });
++
++    test('NXDOMAIN (rcode 3) → null', () {
++      expect(parseDohResponse(_hex(_respNxdomain)), isNull);
++    });
++
++    test('NOERROR with zero answers → empty list', () {
++      expect(parseDohResponse(_hex(_respNoAnswers)), isEmpty);
++    });
++
++    test('truncated garbage → null, never throws', () {
++      expect(parseDohResponse(Uint8List.fromList([1, 2, 3])), isNull);
++      expect(parseDohResponse(Uint8List(0)), isNull);
++      // Header claiming 1 answer but no body.
++      expect(
++        parseDohResponse(
++          Uint8List.fromList([0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 0]),
++        ),
++        isNull,
++      );
++    });
++
++    test('compression pointer at the start of an answer parses through', () {
++      // Owner name is a pointer to the (empty root) question name — the
++      // pointer terminates the name and parsing must resume right after it,
++      // not inside the jump target.
++      final msg = Uint8List.fromList([
++        0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, // header
++        0, // question name: root
++        0, 1, 0, 1, // QTYPE=A QCLASS=IN
++        0xC0, 0x0C, // owner: pointer to offset 12
++        0, 1, 0, 1, 0, 0, 0, 60, 0, 4, // A, IN, ttl, rdlen 4
++        1, 2, 3, 4, // rdata
++      ]);
++      expect(parseDohResponse(msg), ['1.2.3.4']);
++    });
++  });
++
++  group('DohClient.configure', () {
++    test('accepts every provider id without throwing', () {
++      final c = DohClient.instance;
++      for (final id in [
++        DohClient.off,
++        DohClient.cloudflare,
++        DohClient.google,
++        DohClient.adguard,
++        DohClient.quad9,
++        99, // unknown → falls back to a working default
++      ]) {
++        expect(() => c.configure(id), returnsNormally);
++      }
++    });
++  });
++}
+diff --git a/test/core/net/resilient_http_overrides_test.dart b/test/core/net/resilient_http_overrides_test.dart
+new file mode 100644
+index 0000000..dae259c
+--- /dev/null
++++ b/test/core/net/resilient_http_overrides_test.dart
+@@ -0,0 +1,339 @@
++import 'dart:async';
++import 'dart:convert';
++import 'dart:io';
++import 'dart:typed_data';
++
++import 'package:flutter_test/flutter_test.dart';
++import 'package:watch_app/core/net/resilient_http_overrides.dart';
++
++/// Collects everything a socket sends and hands out prefixes on demand.
++/// Sockets are single-subscription streams, so one persistent listener per
++/// socket serves every `take` in a test. Only used on sockets the relay does
++/// NOT listen (the relay owns both ends of its pair).
++class _Reader {
++  _Reader(Socket s) {
++    _sub = s.listen(
++      (chunk) {
++        _acc.addAll(chunk);
++        _wake();
++      },
++      onDone: () {
++        _closed = true;
++        _wake();
++      },
++      onError: (Object e) {
++        _closed = true;
++        _error = e;
++        _wake();
++      },
++    );
++  }
++
++  final List<int> _acc = [];
++  final List<Completer<void>> _waiters = [];
++  late final StreamSubscription<Uint8List> _sub;
++  bool _closed = false;
++  Object? _error;
++
++  void _wake() {
++    for (final c in _waiters) {
++      if (!c.isCompleted) c.complete();
++    }
++    _waiters.clear();
++  }
++
++  Future<Uint8List> take(int n) async {
++    while (_acc.length < n && !_closed) {
++      final c = Completer<void>();
++      _waiters.add(c);
++      if (_acc.length < n && !_closed) await c.future;
++    }
++    if (_acc.length < n) {
++      throw StateError(
++        'socket closed with ${_acc.length} of $n bytes ($_error)',
++      );
++    }
++    final out = Uint8List.fromList(_acc.sublist(0, n));
++    _acc.removeRange(0, n);
++    return out;
++  }
++
++  void close() => _sub.cancel();
++}
++
++List<int> _ascii(String s) => s.codeUnits;
++
++Future<void> _until(bool Function() condition) async {
++  for (var i = 0; i < 200; i++) {
++    if (condition()) return;
++    await pumpEventQueue();
++  }
++  fail('condition not reached');
++}
++
++void main() {
++  setUp(resetResolverState);
++
++  group('pickConnectPath (the resolver policy)', () {
++    test('literal IPs never touch a resolver', () {
++      expect(
++        pickConnectPath(
++          host: '192.168.1.23',
++          isSecure: false,
++          osAlive: false,
++          dohAlive: true,
++        ),
++        ConnectPath.nativeLiteral,
++      );
++      expect(
++        pickConnectPath(
++          host: '2606:4700:4700::1111',
++          isSecure: true,
++          osAlive: false,
++          dohAlive: true,
++        ),
++        ConnectPath.nativeLiteral,
++      );
++    });
++
++    test('healthy OS resolver → stock SDK path (http and https)', () {
++      for (final secure in [false, true]) {
++        expect(
++          pickConnectPath(
++            host: 'example.com',
++            isSecure: secure,
++            osAlive: true,
++            dohAlive: true,
++          ),
++          ConnectPath.native,
++        );
++      }
++    });
++
++    test('OS dead + DoH alive → rescue (plain vs relay by scheme)', () {
++      expect(
++        pickConnectPath(
++          host: 'cdn.example.com',
++          isSecure: false,
++          osAlive: false,
++          dohAlive: true,
++        ),
++        ConnectPath.dohPlain,
++      );
++      expect(
++        pickConnectPath(
++          host: 'cdn.example.com',
++          isSecure: true,
++          osAlive: false,
++          dohAlive: true,
++        ),
++        ConnectPath.dohTlsRelay,
++      );
++    });
++
++    test('OS dead + DoH dead → native (surface the real error)', () {
++      expect(
++        pickConnectPath(
++          host: 'cdn.example.com',
++          isSecure: true,
++          osAlive: false,
++          dohAlive: false,
++        ),
++        ConnectPath.native,
++      );
++    });
++  });
++
++  group('LoopbackRelay', () {
++    // The relay listens BOTH ends of its pair, so the test observes at the
++    // echo SERVER side (its own sockets) and, for the https case, through a
++    // real HttpClient (see the end-to-end group below).
++    late ServerSocket echo;
++    final serverSide = <Socket>[];
++    final received = <int>[];
++    late int relayPort;
++
++    setUp(() async {
++      serverSide.clear();
++      received.clear();
++      echo = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
++      echo.listen((s) {
++        serverSide.add(s);
++        s.listen((c) {
++          received.addAll(c);
++          s.add(c); // echo back
++        }, onError: (_) => s.destroy());
++      });
++      relayPort = await LoopbackRelay.instance.ensure();
++    });
++
++    tearDown(() {
++      echo.close();
++    });
++
++    test('consumes the 16-byte token and forwards only the payload', () async {
++      final upstream = await Socket.connect('127.0.0.1', echo.port);
++      final token = LoopbackRelay.instance.enqueue(upstream);
++
++      final client = await Socket.connect('127.0.0.1', relayPort);
++      // Token + payload in ONE write: exercises the coalesced leading-bytes
++      // path — the token must be consumed, the payload forwarded.
++      client.add([...token, ..._ascii('ping')]);
++      await _until(() => utf8.decode(received) == 'ping');
++      expect(utf8.decode(received), 'ping');
++      client.destroy();
++      upstream.destroy();
++    });
++
++    test('accepts a fragmented token (slow gate client)', () async {
++      final upstream = await Socket.connect('127.0.0.1', echo.port);
++      final token = LoopbackRelay.instance.enqueue(upstream);
++
++      final client = await Socket.connect('127.0.0.1', relayPort);
++      client.add(token.sublist(0, 8));
++      await client.flush();
++      await pumpEventQueue();
++      client.add([...token.sublist(8), ..._ascii('ok')]);
++      await _until(() => utf8.decode(received) == 'ok');
++      expect(utf8.decode(received), 'ok');
++      client.destroy();
++      upstream.destroy();
++    });
++
++    test(
++      'rejects a wrong token and keeps the parked upstream for the real client',
++      () async {
++        final upstream = await Socket.connect('127.0.0.1', echo.port);
++        final token = LoopbackRelay.instance.enqueue(upstream);
++
++        // An impostor (wrong token) must be dropped without polluting upstream…
++        final impostor = await Socket.connect('127.0.0.1', relayPort);
++        impostor.add(Uint8List.fromList(List.filled(16, 0xAB)));
++        await impostor.flush();
++        await pumpEventQueue();
++        impostor.destroy();
++        await pumpEventQueue();
++        expect(received, isEmpty);
++
++        // …and the parked upstream must still serve the genuine client.
++        final client = await Socket.connect('127.0.0.1', relayPort);
++        client.add([...token, ..._ascii('hi')]);
++        await _until(() => utf8.decode(received) == 'hi');
++        expect(utf8.decode(received), 'hi');
++        client.destroy();
++        upstream.destroy();
++      },
++    );
++  });
++
++  group('spliceNew (the upstream→client pump leg)', () {
++    test('forwards bytes with backpressure wiring in place', () async {
++      // spliceNew pumps `from`'s incoming stream into `to`, so the payload
++      // must be written by the SOURCE server for the pump to carry it.
++      final source = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
++      final sinkServer = await ServerSocket.bind(
++        InternetAddress.loopbackIPv4,
++        0,
++      );
++      final sinkSide = <_Reader>[];
++      source.listen((s) => s.add(_ascii('payload')));
++      sinkServer.listen((s) => sinkSide.add(_Reader(s)));
++      addTearDown(() {
++        source.close();
++        sinkServer.close();
++      });
++
++      final from = await Socket.connect('127.0.0.1', source.port);
++      final to = await Socket.connect('127.0.0.1', sinkServer.port);
++      LoopbackRelay.spliceNew(from, to);
++
++      expect(String.fromCharCodes(await sinkSide.single.take(7)), 'payload');
++      from.destroy();
++      to.destroy();
++      for (final r in sinkSide) {
++        r.close();
++      }
++    });
++  });
++
++  group('ResilientHttpOverrides end-to-end', () {
++    test('http to a literal IP goes straight through (native path)', () async {
++      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
++      final sub = server.listen((req) async {
++        req.response.write('hello from loopback');
++        await req.response.close();
++      });
++      HttpOverrides.global = ResilientHttpOverrides(HttpOverrides.current);
++      addTearDown(() async {
++        HttpOverrides.global = null;
++        await sub.cancel();
++        await server.close(force: true);
++      });
++
++      final client = HttpClient();
++      final req = await client.getUrl(
++        Uri.parse('http://127.0.0.1:${server.port}/x'),
++      );
++      final res = await req.close();
++      expect(res.statusCode, 200);
++      final body = <int>[];
++      await for (final chunk in res) {
++        body.addAll(chunk);
++      }
++      expect(utf8.decode(body), 'hello from loopback');
++      client.close();
++    });
++
++    test(
++      'https rescue end-to-end: dead OS + DoH IP → TLS in factory → relay',
++      () async {
++        // Trust the test CA process-wide, like installSupplementalTrustRoots
++        // does for the Mozilla bundle.
++        final ca = File('test/fixtures/tls/ca_cert.pem').readAsBytesSync();
++        SecurityContext.defaultContext.setTrustedCertificatesBytes(ca);
++
++        final serverCtx = SecurityContext()
++          ..useCertificateChain('test/fixtures/tls/server_cert.pem')
++          ..usePrivateKey('test/fixtures/tls/server_key.pem');
++        final server = await HttpServer.bindSecure(
++          InternetAddress.anyIPv4,
++          0,
++          serverCtx,
++        );
++        final sub = server.listen((req) async {
++          req.response.write('rescued over DoH');
++          await req.response.close();
++        });
++        HttpOverrides.global = ResilientHttpOverrides(
++          HttpOverrides.current,
++          // Simulate the broken-Private-DNS network: every OS lookup dead…
++          osProbe: (_) async => false,
++          // …and DoH answering with the server's loopback IP.
++          dohResolve: (_) async => [InternetAddress.loopbackIPv4],
++        );
++        addTearDown(() async {
++          HttpOverrides.global = null;
++          await sub.cancel();
++          await server.close(force: true);
++        });
++
++        // Hostname (not a literal) → rescue path: connect to the DoH IP,
++        // TLS with SNI + hostname verification for test.local, opaque relay
++        // socket handed to the SDK. HttpClient must see a normal response.
++        final client = HttpClient();
++        final req = await client.getUrl(
++          Uri.parse('https://test.local:${server.port}/x'),
++        );
++        final res = await req.close();
++        expect(res.statusCode, 200);
++        final body = <int>[];
++        await for (final chunk in res) {
++          body.addAll(chunk);
++        }
++        expect(utf8.decode(body), 'rescued over DoH');
++        client.close();
++      },
++      timeout: const Timeout(Duration(seconds: 30)),
++    );
++  });
++}
+diff --git a/test/fixtures/tls/ca_cert.pem b/test/fixtures/tls/ca_cert.pem
+new file mode 100644
+index 0000000..7546b17
+--- /dev/null
++++ b/test/fixtures/tls/ca_cert.pem
+@@ -0,0 +1,19 @@
++-----BEGIN CERTIFICATE-----
++MIIDFzCCAf+gAwIBAgIUKJyVmkOrCpl0O1QAb4gTfZf4ggMwDQYJKoZIhvcNAQEL
++BQAwGzEZMBcGA1UEAwwQWmFuZ2V0c3UgVGVzdCBDQTAeFw0yNjEwMzAxMjA3NDZa
++Fw0zNjEwMjcxMjA3NDZaMBsxGTAXBgNVBAMMEFphbmdldHN1IFRlc3QgQ0EwggEi
++MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDBH+CNdWzAouvkw88dRtz/qTb+
++8ndmpa5SVRIjmJ1Ls/kADzQF4SUbGsISvI+brElzQOQDJYRbCNXGzr8ZLqtUcwoy
++f72SC23gZ9yKgNPK1C+egkktAbKjQ1Pxy9h1jfE8g8qlnXE/fauZ0EznzJ5DkcxU
++Y7sc8hql4JJVf1gNWeGA28IwYXuyrLKChv+cyXAy8yeGqCd4Ny2gKe2XHS8ttsZy
++jUFdlRZ4WIoTiqJD2dMjb0kEkhKykeD1Qib6IGaGtnQSSJRIAZA5/QWFgLIzalT/
++WhvrgfrHWyq/A1YVz9t8/F0qMUGjRjJiRoM5jxby0ZAmQ5AHksfMEl8PgJ5XAgMB
++AAGjUzBRMB0GA1UdDgQWBBSLr2a8jto22w3njO+EHKskzmiUGTAfBgNVHSMEGDAW
++gBSLr2a8jto22w3njO+EHKskzmiUGTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3
++DQEBCwUAA4IBAQAOhBIGklOuA1qucni0QW4ukKXK1phWJzKas06Qq95EkJnfiTdd
++bde68qo9DZFXaA5yvv6RuVWjn4JxCopSkvZb1QAnbJBCAHK5Zgz7hhRySIYFeW8s
++3mrZddlPiDcg5S39qEXOQksXtCAnCbtLgvbsiWDVxx9dbdhNRJLB4Wb0rDYTGiny
++mPbZiexBC4QPtCq1wh21P7EOlcqQFOk8ytf4cwKuCDEMeG3QqcHfw3Z9OCOI+EjC
++lnGz8mypto1HyIeiS+YmC967B322KA+XyzExts5emMizSan9wQA3zxv2gP7dfyTI
++qSsNu3PMA11L0qnkQtzXhIdahGgCzApAc2XH
++-----END CERTIFICATE-----
+diff --git a/test/fixtures/tls/server_cert.pem b/test/fixtures/tls/server_cert.pem
+new file mode 100644
+index 0000000..58d8746
+--- /dev/null
++++ b/test/fixtures/tls/server_cert.pem
+@@ -0,0 +1,20 @@
++-----BEGIN CERTIFICATE-----
++MIIDRDCCAiygAwIBAgIUaWpd3ArS/hXWHz4FkvE5/DJf6c8wDQYJKoZIhvcNAQEL
++BQAwGzEZMBcGA1UEAwwQWmFuZ2V0c3UgVGVzdCBDQTAeFw0yNjEwMzAxMjA3NDZa
++Fw0zNjEwMjcxMjA3NDZaMBUxEzARBgNVBAMMCnRlc3QubG9jYWwwggEiMA0GCSqG
++SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDItq1g8MqKB8CBdsK9X0fhWf/RgxBwT55b
++unx/XLsutUeYFluvMcrFJuYr9ewrkZ/FxG/z44qw7TwKNfXC8WELkOcvyolfO+s9
++L6xph9ew6+F3BXfD0I1acvGAlG7bwKnPB7fw59naQfAvwuh+bhMZFJZQ5XWf7iyk
++mMh0IDbBPcICj+xZED6emiIhgQjcE3UbXaQdgALDufy7K/nWKtlMNcz5mci96CXA
++tptuPcsFlspwLosbl8IWj+cPcm2iP6nUBhjWssvcpAM3bZmdPRLsiuRuS1/S/kT4
++OgLSmr5mQQm1OOuzlR9AAC53fOkGsEBgpDAY/I9QBXlui9mq4bXPAgMBAAGjgYUw
++gYIwKwYDVR0RBCQwIoIKdGVzdC5sb2NhbIIOYWx0LnRlc3QubG9jYWyHBH8AAAEw
++EwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFHYHFS0uiKAoziY7zOvlI3HA
++XFStMB8GA1UdIwQYMBaAFIuvZryO2jbbDeeM74QcqyTOaJQZMA0GCSqGSIb3DQEB
++CwUAA4IBAQA9lHEPJZpApz+O+acL7ObU9TmdkdEIhqpu5J6Kx8JkiR6vl+QOJB4y
++QFhnSgjwHw0ewKwjA8lrJWkklDYOGTakJlKCwcOpkA1b+In6+o7/bFE+vrFpXNF2
++lCobMASDwMlc4CIcbWlbJBPaYJyGH9gWvnsKd7PcPj5Q6apV/jONdwTBoYQDAuoI
++WMupAeqWD3ESp08taNmqqe61RLqB56Iew/CzTFJkTNS+obh6IhJ4ORi8LkNhTSvk
++mAq05NOjLj6VK/3mpottE13RmdJTY0FlFmTvmC0/t4ZA4CdLEyygDV7AIFfB+JCa
++XoLHmM8CE5mCMjOiuQL+BzZxYtfdJRYI
++-----END CERTIFICATE-----
+diff --git a/test/fixtures/tls/server_key.pem b/test/fixtures/tls/server_key.pem
+new file mode 100644
+index 0000000..0ab6ca6
+--- /dev/null
++++ b/test/fixtures/tls/server_key.pem
+@@ -0,0 +1,28 @@
++-----BEGIN PRIVATE KEY-----
++MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDItq1g8MqKB8CB
++dsK9X0fhWf/RgxBwT55bunx/XLsutUeYFluvMcrFJuYr9ewrkZ/FxG/z44qw7TwK
++NfXC8WELkOcvyolfO+s9L6xph9ew6+F3BXfD0I1acvGAlG7bwKnPB7fw59naQfAv
++wuh+bhMZFJZQ5XWf7iykmMh0IDbBPcICj+xZED6emiIhgQjcE3UbXaQdgALDufy7
++K/nWKtlMNcz5mci96CXAtptuPcsFlspwLosbl8IWj+cPcm2iP6nUBhjWssvcpAM3
++bZmdPRLsiuRuS1/S/kT4OgLSmr5mQQm1OOuzlR9AAC53fOkGsEBgpDAY/I9QBXlu
++i9mq4bXPAgMBAAECggEATYksPwel5l6KQjkDj65QEUD4LxJndkt7jEnlMDo9YRTM
++fHceofYlM7YMMq1Et6wAwaBZ8yhSeniaugMQVmdyqsomVPLz0GNQQ4m4G+hLLWBh
++792f33ggMvG2U4qDrMankn+T0i9um/7e70RnFfglzomCa+vIXajffBI9VYbgQBOR
++Rp5aadHzxXqfub8qXgGHl8rR7lSYK4UfuZoOV58gTiOTuWb+e53fimMDct9PCf1I
++eR4YRQGXdALZp4zcpXht0yEbAXPd3n39jRgZuQiFO5qvl89P/ZdYIxtyb//pGFiy
++1mARGgSnQ6jYkE0krz8KyJRtsnNpqU3jiyQzIVBcwQKBgQDmuUks3G9fUIbMSWWW
++9rYgo+o7ANAnpz7i/AWdCwTajEsMFYmK+EXm2fWeQLtgxg9kZBu4S2eBC93iUKzQ
++udL7X012uNJyJSbJQQd7jQc1aoPBa3cRt2banUi/0taXr/IYGVfUafnd+1zuHJr4
++BItYwi018+mgrhcIcDnsG3jQIQKBgQDes78/8fY633gGwZRKJ6iQz3rV33RshHzY
++8Wrw7zZgf2KCOnYbyk1DwzSRfQqCqkP/uNPdFfYQ9EOuoRQZPTDbcAeyKJDZLqhv
++Ag+xoiGO4J/aX4POplT0FVEgQrZ6qFYCk2LmtaxumJg/XNEgLQfvJ/Zu7+e0Ad3P
++HRUp3JaH7wKBgGZGPgy3zlrG/Gn0IydPR56iaoMrMhpRxcuige6CYu1qAR5jMaw7
++r+jMN1emRCl6wnny8mK4cjI/C2V185U2ujKZpWH6PbdBhrbxr5pyAn8IL01/ELH2
++xY4k6Im3sU5ePQe3vDo5m/xtn10hqwREJ2z57kabT7XdVfJ0pQhniR9hAoGAY7Ua
++ZWjRk15GANBesiy7Xcpm9qaLG6Ldusur059mOyINWr0N8DdNDI+zU4gmUoYk17NK
++t+uDNegG/YKE2x/4ZebsqylaYMJxCvJjUGaEm9GaAE1PWBBEbNu2bLkxtgz0JUcT
++urOQNhv/3i6SOtOuf7bmsJicpo1HX9lnhkyK4OUCgYAqvV5ccf1yRMImzehEh+8I
++h0UaGWOxDLgzH5SynJsZHINDKiQVzM/t8Rha4jeopCblT3y4off2C7SFtqSTLCa0
++TaDfAx/KClfckOw0etis/HyvrdqyEv9jqAS7bnyFADvgiho38Z48DlPO0Am2P5Il
++yl0GMlxj7b2YmoQKmO5VrQ==
++-----END PRIVATE KEY-----
