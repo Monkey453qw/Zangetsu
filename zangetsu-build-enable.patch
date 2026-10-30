@@ -1,0 +1,49 @@
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index fa7abfb..486df8f 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -54,12 +54,11 @@ android {
+     }
+ 
+     buildFeatures { prefab = true }
+-    externalNativeBuild {
+-        cmake {
+-            path = file("src/main/cpp/CMakeLists.txt")
+-            version = "3.22.1"
+-        }
+-    }
++    // BUILD-LOCAL: externalNativeBuild removed — the only CMake target was the
++    // Discord bridge, and this environment has no Discord Social SDK. The
++    // torrent engine ships prebuilt (org.libn4j AARs), libmpv ships prebuilt
++    // (media_kit_libs). At runtime the bridge's loadLibrary fails and is
++    // caught → DISCORD_SDK_UNAVAILABLE (handled by the Dart side).
+ 
+     // Drop x86/x86_64 (emulator-only) native libs from every output — including
+     // the prebuilt plugin lib (libmpv) that abiFilters / --target-platform do
+diff --git a/android/app/src/main/cpp/CMakeLists.txt b/android/app/src/main/cpp/CMakeLists.txt
+index 7045a81..b382d42 100644
+--- a/android/app/src/main/cpp/CMakeLists.txt
++++ b/android/app/src/main/cpp/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ cmake_minimum_required(VERSION 3.22.1)
+ project(zangetsu_discord LANGUAGES CXX)
+-find_package(discord_partner_sdk REQUIRED CONFIG)
+-add_library(zangetsu_discord SHARED discord_presence.cpp)
++# BUILD-ONLY: swap in discord_presence.cpp (and remove this stub) when the
++# real Discord Social SDK prefab package is available.
++add_library(zangetsu_discord SHARED discord_presence_stub.cpp)
+ target_compile_features(zangetsu_discord PRIVATE cxx_std_17)
+-target_link_libraries(zangetsu_discord discord_partner_sdk::discord_partner_sdk log)
++target_link_libraries(zangetsu_discord log)
+diff --git a/android/app/src/main/cpp/discord_presence_stub.cpp b/android/app/src/main/cpp/discord_presence_stub.cpp
+new file mode 100644
+index 0000000..993a9b6
+--- /dev/null
++++ b/android/app/src/main/cpp/discord_presence_stub.cpp
+@@ -0,0 +1,6 @@
++// BUILD-ONLY stub. The real discord_presence.cpp requires the Discord Social
++// SDK (not redistributable; fetched manually from the Discord developer
++// portal). With this stub the bridge's loadLibrary("discord_partner_sdk")
++// fails at runtime and is caught -> DISCORD_SDK_UNAVAILABLE, which the Dart
++// side handles as "SDK unavailable on this build". Every other feature of
++// the app is unaffected.
